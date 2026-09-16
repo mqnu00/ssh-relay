@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Wrapper around platform-tools' adb.
+#
+# adb (1.0.41 / platform-tools 37.0.1) ignores ANDROID_USER_HOME and insists on
+# creating `$HOME/.android`, which aborts with
+#   Cannot mkdir '/home/lzh/.android': Permission denied
+# on this box, because $HOME is not writable. Pointing HOME at a workspace-local
+# directory is enough. It is scoped to adb on purpose so that tools which genuinely
+# need the real HOME (docker, ssh) keep working.
+#
+# scripts/ is prepended to PATH in env.sh so this wrapper wins over the real binary.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REAL_ADB="${ANDROID_HOME:-$ROOT/.toolchain/android-sdk}/platform-tools/adb"
+ADB_HOME="${SSHRELAY_TOOLCHAIN:-$ROOT/.toolchain}/adb-home"
+
+if [ ! -x "$REAL_ADB" ]; then
+  echo "adb not found at $REAL_ADB (run: python3 scripts/provision.py)" >&2
+  exit 1
+fi
+
+mkdir -p "$ADB_HOME"
+export HOME="$ADB_HOME"
+exec "$REAL_ADB" "$@"
