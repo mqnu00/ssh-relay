@@ -121,9 +121,52 @@ JDK、Android SDK、Gradle 及其缓存都以**完全相同的路径**挂载进�
 
 ---
 
-## 4. 测试与验证
+## 4. 构建与发布
 
-### 4.1 纯 JVM（不需要模拟器，秒级反馈）
+```bash
+# Debug 包：已用 debug 证书签名，装到设备上直接用
+./gradlew :app:assembleDebug
+# -> app/build/outputs/apk/debug/app-debug.apk
+
+# Release 包：需要先有签名密钥（见下），否则产物是 unsigned、装不上
+scripts/make-keystore.sh              # 一次性，会让你输入自己的口令
+./gradlew :app:assembleRelease        # -> app/build/outputs/apk/release/app-release.apk
+./gradlew :app:bundleRelease          # -> app/build/outputs/bundle/release/app-release.aab（上架 Google Play 用）
+```
+
+### 4.1 签名密钥
+
+`scripts/make-keystore.sh` 生成两样东西，**都在 `.gitignore` 里**：
+
+| 文件 | 说明 |
+|---|---|
+| `.toolchain/keystore/release.jks` | PKCS12 密钥库，RSA 4096，有效期 10000 天 |
+| `keystore.properties` | Gradle 读取的口令与路径（`chmod 600`） |
+
+**请立刻把这它们备份到安全的地方。**Android 只允许用**同一把密钥**更新已安装的应用：
+密钥丢了，就再也无法给已装的 App 推送更新（Google Play 上，如果启用了 Play App Signing，
+丢的是*上传密钥*还能申请重置；丢了*应用签名密钥*则不可恢复）。同理，这把密钥不能提交到仓库——
+`.gitignore` 已屏蔽 `keystore.properties`、`*.jks`、`*.keystore`。
+
+没有密钥时 `assembleRelease` 不会失败，只是产出未签名的包，并打印提示告诉你该跑哪个脚本。
+
+### 4.2 实测的产物属性
+
+| 项 | 值 |
+|---|---|
+| APK 签名方案 | `apksigner verify` → `Verifies`，**v3**（v1/v2 关闭） |
+| AAB 签名 | `jarsigner -verify` → `jar verified`（自签名证书的 "invalid certificate chain" 警告是正常的） |
+| 16KB 页对齐 | 签名后仍然 `zipalign -c -P 16 -v 4` → `Verification succesful` |
+| minSdk / targetSdk | 35 / 35（因此只能装到 **Android 15 及以上**） |
+| 体积 | APK 19.9 MB、AAB 6.9 MB（debug 包 26.5 MB） |
+
+关于签名方案：AGP 在这里是**二选一**，不是叠加——不设 `enableV3Signing` 时产出 v2-only，
+设了则产出 v3-only（都实测过）。选 v3，因为它支持日后轮换签名密钥，而本应用支持的设备
+全都远超引入 v3 的 Android 9。
+
+## 5. 测试与验证
+
+### 5.1 纯 JVM（不需要模拟器，秒级反馈）
 
 ```bash
 ./gradlew :core-forward:test :core-ssh:test     # 32 个测试
@@ -134,7 +177,7 @@ JDK、Android SDK、Gradle 及其缓存都以**完全相同的路径**挂载进�
 密码与 **ed25519 私钥（含 bcrypt 加密私钥的口令）** 认证、
 认证失败不重试、以及**内嵌真实 SSH 服务端的端到端转发**。
 
-### 4.2 模拟器端到端
+### 5.2 模拟器端到端
 
 ```bash
 scripts/emulator.sh accel              # Gate 0：确认 KVM 可用（必要时自动走容器）
@@ -165,7 +208,7 @@ scripts/connected-test.sh dev.sshrelay.TunnelEndToEndTest   # 或按类分批
 | `BrowserAcceptanceTest` | **用 App 内置 WebView（真实 Chromium 引擎）打开转发地址**，读取 `document.body.innerText` 断言其中同时含页面标记与 `127.0.0.1`，并自动截图存证；另有一个"保持隧道开启"的用例，供宿主侧脚本做跨应用验收 |
 | `DeviceOnlyBehaviourTest` | Android Keystore 加解密往返、前台服务通知构造与停止动作 |
 
-### 4.3 浏览器验收取证
+### 5.3 浏览器验收取证
 
 ```bash
 scripts/verify-browser.sh              # 跨应用浏览器验收（服务端访问日志判定）
@@ -194,7 +237,7 @@ http request #4  uri=/?proof=1789527641  peer=/127.0.0.1:60820
 
 ---
 
-## 5. Android 15（API 35）相关实现要点
+## 6. Android 15（API 35）相关实现要点
 
 | 约束 | 本项目的处理 |
 |---|---|
@@ -214,7 +257,7 @@ http request #4  uri=/?proof=1789527641  peer=/127.0.0.1:60820
 
 ---
 
-## 6. 已知限制
+## 7. 已知限制
 
 - 仅实现 `-L`（本地转发）。`-R` / `-D`(SOCKS) 未实现。
 - 已知主机指纹的删除入口在界面「已知主机密钥」区域，属于手动操作（符合预期：防止误点绕过告警）。

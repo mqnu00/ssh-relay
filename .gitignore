@@ -5,6 +5,12 @@
 __pycache__/
 *.pyc
 
+# Release signing material. Never commit these: an app can only ever be updated
+# with the same signing key, so a leaked key means anyone can publish updates as you.
+keystore.properties
+*.jks
+*.keystore
+
 # Build outputs
 build/
 */build/

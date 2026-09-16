@@ -1,8 +1,22 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
+
+// Release signing. Credentials live in keystore.properties at the repository root,
+// which is gitignored -- see scripts/make-keystore.sh. When the file is absent the
+// release build still runs, it just produces an unsigned APK, so a fresh clone or a
+// CI job without secrets is not broken by it.
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val keystoreProperties = Properties().apply {
+    if (keystorePropertiesFile.exists()) {
+        keystorePropertiesFile.inputStream().use { load(it) }
+    }
+}
+val releaseSigningConfigured = keystoreProperties.getProperty("storeFile") != null
 
 android {
     namespace = "dev.sshrelay"
@@ -30,9 +44,31 @@ android {
         buildConfigField("String", "E2E_SSH_PASSWORD", "\"testpass\"")
     }
 
+    signingConfigs {
+        if (releaseSigningConfigured) {
+            create("release") {
+                // Paths in keystore.properties are relative to the repository root.
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+                // APK Signature Scheme v3 rather than AGP's v2 default. Measured
+                // behaviour: AGP emits one or the other, not both -- with this flag
+                // unset the APK verifies as v2-only, with it set as v3-only. v3 is the
+                // better of the two (it is what lets the signing key be rotated later)
+                // and every device this app supports runs Android 15, well past the
+                // Android 9 that introduced v3.
+                enableV3Signing = true
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (releaseSigningConfigured) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 
@@ -59,6 +95,22 @@ kotlin {
     compilerOptions {
         jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
     }
+}
+
+// Only worth saying when a release artifact is actually being built.
+if (!releaseSigningConfigured &&
+    gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
+) {
+    logger.lifecycle(
+        """
+        |
+        |keystore.properties not found: the release APK/AAB will be UNSIGNED and cannot
+        |be installed. Create a signing key once with:
+        |
+        |    scripts/make-keystore.sh
+        |
+        """.trimMargin()
+    )
 }
 
 dependencies {
