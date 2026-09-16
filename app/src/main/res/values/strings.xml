@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SSH Relay</string>
+    <string name="notification_channel_name">隧道状态</string>
+    <string name="notification_channel_description">SSH 端口转发的运行状态</string>
+    <string name="notification_stop">停止</string>
+</resources>
