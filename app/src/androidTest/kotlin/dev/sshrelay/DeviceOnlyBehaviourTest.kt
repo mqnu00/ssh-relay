@@ -2,6 +2,7 @@ package dev.sshrelay
 
 import android.app.NotificationManager
 import android.content.Context
+import android.provider.Settings
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.sshrelay.data.SecretStore
@@ -9,9 +10,13 @@ import dev.sshrelay.forward.ForwardRule
 import dev.sshrelay.service.TunnelNotifications
 import dev.sshrelay.ssh.ForwardStatus
 import dev.sshrelay.ssh.TunnelState
+import dev.sshrelay.system.BatteryOptimization
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -25,6 +30,13 @@ class DeviceOnlyBehaviourTest {
 
     private val context: Context
         get() = InstrumentationRegistry.getInstrumentation().targetContext
+
+    /** Runs a shell command as the shell user and returns its stdout. */
+    private fun shell(command: String): String =
+        java.io.FileInputStream(
+            InstrumentationRegistry.getInstrumentation().uiAutomation
+                .executeShellCommand(command).fileDescriptor,
+        ).use { it.readBytes().toString(Charsets.UTF_8) }
 
     /**
      * Notification channels and posts behave differently depending on whether
@@ -105,5 +117,54 @@ class DeviceOnlyBehaviourTest {
         ).forEach { state ->
             assertNotNull("build() failed for $state", notifications.build(state, forwards))
         }
+    }
+
+    /**
+     * The exemption is read from the platform, so exercise it through the real
+     * allowlist (`dumpsys deviceidle whitelist`) instead of trusting a mock: this is
+     * the exact state that decides whether the prompt appears.
+     *
+     * Some ROMs do not let the shell user edit the allowlist; there the test skips
+     * rather than failing for a reason that has nothing to do with this app.
+     */
+    @Test
+    fun exemptionFollowsTheSystemAllowlist() {
+        val pkg = context.packageName
+        val wasExempt = BatteryOptimization.isExempt(context)
+        try {
+            shell("dumpsys deviceidle whitelist +$pkg")
+            assumeTrue(
+                "this ROM does not expose the deviceidle allowlist to the shell user",
+                shell("dumpsys deviceidle whitelist").contains(pkg),
+            )
+            assertTrue(
+                "after whitelisting $pkg, isIgnoringBatteryOptimizations must report true",
+                BatteryOptimization.isExempt(context),
+            )
+
+            shell("dumpsys deviceidle whitelist -$pkg")
+            assertFalse(
+                "after removing $pkg from the allowlist it must read as optimised again",
+                BatteryOptimization.isExempt(context),
+            )
+        } finally {
+            if (!wasExempt) runCatching { shell("dumpsys deviceidle whitelist -$pkg") }
+        }
+    }
+
+    /**
+     * Ordering matters: the first entry is a single system dialog scoped to this app,
+     * the later ones are fallbacks for ROMs that do not honour it.
+     */
+    @Test
+    fun batteryExemptionEntryPointsAreOrderedAndAppScoped() {
+        val intents = BatteryOptimization.settingsIntents(context)
+        val packageUri = "package:${context.packageName}"
+
+        assertEquals(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, intents[0].action)
+        assertEquals(packageUri, intents[0].data.toString())
+        assertEquals(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS, intents[1].action)
+        assertEquals(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, intents[2].action)
+        assertEquals(packageUri, intents[2].data.toString())
     }
 }

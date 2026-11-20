@@ -25,6 +25,7 @@
 - 密码 / 私钥（含 passphrase）两种认证方式
 - 多条本地转发规则（`本地端口 → 远端主机:远端端口`），可分别启用/停用
 - 隧道以前台服务常驻：切后台或杀掉界面不中断，通知栏可看状态并一键停止
+- 电池优化豁免引导：未加入「不受电池优化限制」时启动即提示，一键跳到系统确认页（真机后台掉线的头号原因）
 - 断线自动重连（指数退避 + 抖动，1s → 30s）；认证失败/主机密钥变更不盲目重试
 - 主机密钥 TOFU 校验：首次连接记录指纹，之后变更即拒绝连接（防中间人）
 - 凭据用 Android Keystore（AES-GCM）加密存储，日志与通知中不出现
@@ -206,7 +207,7 @@ scripts/connected-test.sh dev.sshrelay.TunnelEndToEndTest   # 或按类分批
 |---|---|
 | `TunnelEndToEndTest` | 设备内建立真实 SSH 隧道，取回 `http://127.0.0.1:18080/`；断言页面标记、断言 HTTP 服务看到的来源是 `127.0.0.1`（证明请求确实穿过隧道）、断言设备 LAN 地址连不通（证明只绑定回环）、6 路并发请求；错误密码进入 `Failed` 而非无限重连 |
 | `BrowserAcceptanceTest` | **用 App 内置 WebView（真实 Chromium 引擎）打开转发地址**，读取 `document.body.innerText` 断言其中同时含页面标记与 `127.0.0.1`，并自动截图存证；另有一个"保持隧道开启"的用例，供宿主侧脚本做跨应用验收 |
-| `DeviceOnlyBehaviourTest` | Android Keystore 加解密往返、前台服务通知构造与停止动作 |
+| `DeviceOnlyBehaviourTest` | Android Keystore 加解密往返、前台服务通知构造与停止动作；电池优化豁免：真实修改 `dumpsys deviceidle whitelist` 后 `isIgnoringBatteryOptimizations` 必须随之变化，以及三个系统设置入口的顺序与作用域 |
 
 ### 5.3 浏览器验收取证
 
@@ -244,6 +245,7 @@ http request #4  uri=/?proof=1789527641  peer=/127.0.0.1:60820
 | 前台服务必须声明类型 | 使用 `specialUse` + `PROPERTY_SPECIAL_USE_FGS_SUBTYPE="ssh_port_forwarding"`。**不能用 `dataSync`**：Android 15 对它有 6 小时/天的累计上限，长连接隧道会被系统掐断 |
 | 后台不能启动前台服务 | 只从可见 UI 的按钮启动，并捕获启动失败并提示 |
 | `POST_NOTIFICATIONS` 运行时权限 | 已在清单声明；未授权时前台服务照常运行 |
+| 未豁免电池优化的应用会被 Doze/冻结 | 清单声明 `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`；启动时检测 `isIgnoringBatteryOptimizations`，未豁免则弹框，按钮依次尝试 `ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`（应用级一键确认）→ `ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS`（列表页）→ `ACTION_APPLICATION_DETAILS_SETTINGS`（ROM 兜底，ColorOS/HyperOS 的自启动也在这里）。回到前台时用 `LifecycleEventEffect(ON_RESUME)` 重新读取状态 |
 | 非特权应用不能绑定 <1024 端口 | UI 与 `PortPolicy` 双重校验，直接给出中文原因而不是运行时 EACCES |
 | targetSdk 35 强制边到边 | `enableEdgeToEdge()` + Compose insets 处理 |
 | 16KB page size 要求 | 选用纯 Java 的 JSch，**不含任何 `.so`**，天然规避 |
@@ -261,6 +263,7 @@ http request #4  uri=/?proof=1789527641  peer=/127.0.0.1:60820
 
 - 仅实现 `-L`（本地转发）。`-R` / `-D`(SOCKS) 未实现。
 - 已知主机指纹的删除入口在界面「已知主机密钥」区域，属于手动操作（符合预期：防止误点绕过告警）。
-- 模拟器与真机在**厂商省电策略**上仍有差异；本项目的保活手段是前台服务 + SSH keepalive，
-  真机若仍被清理，需要在系统设置里关闭对该应用的电池优化。
+- 模拟器与真机在**厂商省电策略**上仍有差异；本项目的保活手段是前台服务 + 电池优化豁免 + SSH keepalive。
+  界面里的「后台保活」卡片会显示当前豁免状态并可跳转系统设置；若某机型仍被清理，
+  还需在应用详情里允许自启动/后台运行（ColorOS、HyperOS 等）。
 - 空闲连接 10 分钟自动回收（防止半开连接长期占用 SSH 通道）。

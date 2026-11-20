@@ -9,12 +9,14 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -27,6 +29,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -70,6 +73,9 @@ fun TunnelScreen(
     val logs by viewModel.logs.collectAsStateWithLifecycle()
     val knownHosts by viewModel.knownHosts.collectAsStateWithLifecycle()
     val message by viewModel.message.collectAsStateWithLifecycle()
+    val pendingChanges by viewModel.pendingChanges.collectAsStateWithLifecycle()
+    val batteryExempt by viewModel.batteryExempt.collectAsStateWithLifecycle()
+    val batteryDialogVisible by viewModel.batteryDialogVisible.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(message) {
@@ -79,9 +85,23 @@ fun TunnelScreen(
         }
     }
 
+    // Offering the exemption is the whole point of this screen's first launch: a
+    // tunnel that the system freezes in the background is the reported bug.
+    LaunchedEffect(Unit) { viewModel.offerBatteryExemption() }
+
+    BatteryExemptionDialog(
+        visible = batteryDialogVisible,
+        onOpenSettings = { viewModel.openBatterySettings()?.let(viewModel::showMessage) },
+        onDismiss = viewModel::dismissBatteryDialog,
+    )
+
     Scaffold(
         topBar = { TopAppBar(title = { Text("SSH 端口转发") }) },
         snackbarHost = { SnackbarHost(snackbarHostState) },
+        // Edits are deliberately not applied live: swapping listeners under a live
+        // tunnel is a decision the user makes, and a sticky bar keeps that decision
+        // reachable no matter how far the list is scrolled.
+        bottomBar = { ApplyBar(pendingChanges, viewModel::apply) },
     ) { padding ->
         LazyColumn(
             modifier = Modifier
@@ -91,6 +111,13 @@ fun TunnelScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item { StatusCard(state, viewModel) }
+            item {
+                PowerCard(
+                    exempt = batteryExempt,
+                    onRequestExemption = { viewModel.openBatterySettings()?.let(viewModel::showMessage) },
+                    onOpenAppDetails = { viewModel.openAppDetails()?.let(viewModel::showMessage) },
+                )
+            }
             item {
                 ConnectionCard(
                     profile = settings.profile,
@@ -130,6 +157,39 @@ fun TunnelScreen(
 }
 
 // ------------------------------------------------------------------ status
+
+/**
+ * Sticky "there is something to apply" bar. Only shown when the running tunnel
+ * differs from the editor, so a stopped or in-sync tunnel is never cluttered by it.
+ */
+@Composable
+private fun ApplyBar(pendingChanges: Boolean, onApply: () -> Unit) {
+    if (!pendingChanges) return
+    // enableEdgeToEdge() draws under the system bars, so the bar has to claim the
+    // navigation-bar inset itself or its button ends up under the gesture pill.
+    Surface(
+        modifier = Modifier.navigationBarsPadding(),
+        tonalElevation = 3.dp,
+        shadowElevation = 8.dp,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("配置已修改，尚未生效", style = MaterialTheme.typography.labelLarge)
+                Text(
+                    "点“应用”：仅端口规则变更时不断开 SSH；改动了服务器或认证方式则重连一次。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Button(onClick = onApply) { Text("应用") }
+        }
+    }
+}
 
 @Composable
 private fun StatusCard(state: TunnelState, viewModel: TunnelViewModel) {
@@ -176,6 +236,74 @@ private fun StatusCard(state: TunnelState, viewModel: TunnelViewModel) {
                     Button(onClick = viewModel::start) { Text("启动隧道") }
                 }
             }
+        }
+    }
+}
+
+// ------------------------------------------------------ background survival
+
+/**
+ * One-off prompt shown at launch while the app is still subject to battery
+ * optimisation. Returning from Settings re-reads the state, so the dialog disappears
+ * by itself once the user grants the exemption.
+ */
+@Composable
+private fun BatteryExemptionDialog(
+    visible: Boolean,
+    onOpenSettings: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    if (!visible) return
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("允许后台运行，隧道才不会掉") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "系统当前对本应用启用「电池优化」：切到后台后进程可能被冻结、网络断开，" +
+                        "SSH 隧道随之断开，切回前台又会自动重连。"
+                )
+                Text(
+                    "把本应用加入「不受电池优化限制」，隧道才能在后台稳定保持。" +
+                        "点「去设置」后系统会弹出确认框，选择「允许」即可。"
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = onOpenSettings) { Text("去设置") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("暂不") } },
+    )
+}
+
+/**
+ * Persistent view of the exemption, so a dismissed prompt is not the only way back.
+ * The app-details page is offered as well: on OEM ROMs that is where 自启动 /
+ * 后台运行 live, and they gate the tunnel more strictly than the AOSP exemption does.
+ */
+@Composable
+private fun PowerCard(
+    exempt: Boolean,
+    onRequestExemption: () -> Unit,
+    onOpenAppDetails: () -> Unit,
+) {
+    SectionCard("后台保活") {
+        Text(
+            text = if (exempt) "✓ 已不受电池优化限制" else "⚠ 仍在电池优化范围内",
+            color = if (exempt) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        Text(
+            text = if (exempt) {
+                "系统不会因省电策略冻结本应用；若个别机型仍在后台断网，可在「应用详情」里再允许自启动 / 后台运行。"
+            } else {
+                "未允许后台运行：切到后台后系统可能冻结本应用，隧道会断开。点下面的按钮，在系统弹窗里选「允许」。"
+            },
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (!exempt) {
+                Button(onClick = onRequestExemption) { Text("去允许后台运行") }
+            }
+            OutlinedButton(onClick = onOpenAppDetails) { Text("应用详情") }
         }
     }
 }
@@ -278,6 +406,10 @@ private fun RulesCard(
     onUpdate: ((List<RuleConfig>) -> List<RuleConfig>) -> Unit,
 ) {
     SectionCard("转发规则（本机 127.0.0.1:本地端口 → 远端目标）") {
+        Text(
+            "隧道运行中修改端口不会自动生效，改完点底部「应用」。",
+            style = MaterialTheme.typography.bodySmall,
+        )
         rules.forEachIndexed { index, rule ->
             if (index > 0) HorizontalDivider()
             RuleEditor(

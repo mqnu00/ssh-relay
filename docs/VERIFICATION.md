@@ -287,3 +287,53 @@ scripts/run-instrumented.sh                    # L2（直接 am instrument，更
 scripts/verify-browser.sh                      # L3（跨应用浏览器）
 scripts/pull-evidence.sh                       # 取回截图
 ```
+
+## 8. 0.1.1 增量验证（「应用」按钮 + 电池优化豁免）
+
+本次改动针对真机反馈的两个问题：改端口后没有生效入口、切后台立刻断线。环境与 0.1.0 相同
+（`sshrelay_api35` / Android 15 / API 35 / x86_64，模拟器跑在容器里，远端是容器内的测试 sshd）。
+
+```bash
+scripts/emulator.sh start
+scripts/run-test-sshd.sh container      # 远端必须与模拟器同容器，10.0.2.2 才是它
+./gradlew test                          # L1：34/34
+./gradlew :app:assembleDebug :app:assembleDebugAndroidTest
+scripts/run-instrumented.sh             # L2 + L3：OK (10 tests)
+```
+
+| 测试类 | 结果 | 本次相关断言 |
+|---|---|---|
+| `TunnelEndToEndTest` | OK (2) | 端到端取回页面；LAN 地址不可达；错误密码快速失败 |
+| `BrowserAcceptanceTest` | OK (3) | 应用内 WebView 渲染转发页面并断言页面标记 |
+| `DeviceOnlyBehaviourTest` | **OK (5)** | 新增两条：① `dumpsys deviceidle whitelist +dev.sshrelay` 之后 `isIgnoringBatteryOptimizations` 必须变为 `true`，移除后变回 `false`；② 三个系统设置入口的顺序与 `package:` 作用域 |
+| `:core-ssh:test` / `:core-forward:test` | OK (34) | 新增「热换规则不断开会话」「重启不发布 Stopped」两条 |
+
+界面走查（截图在 `artifacts/battery/`，720×1280）：
+
+| 文件 | 内容 |
+|---|---|
+| `01-prompt.png` | 未豁免时的启动提示框（暂不 / 去设置） |
+| `02-after-go-settings.png` | 点「去设置」后系统弹出的 "Let app always run in background?"（`com.android.settings/.fuelgauge.RequestIgnoreBatteryOptimizations`） |
+| `03-allow-return.png` | 点 ALLOW 返回：卡片变「✓ 已不受电池优化限制」，弹出确认提示；`dumpsys deviceidle whitelist` 出现 `user,dev.sshrelay,10154` |
+| `04-revoked.png` | 撤销白名单后回到前台，卡片立刻变回「⚠ 仍在电池优化范围内」（验证 ON_RESUME 重读） |
+| `07-apply-bar.png` | 运行中把本地端口改为 18083，「配置已修改，尚未生效」条出现在导航栏之上 |
+| `08-applied.png` | 点「应用」后的界面 |
+| `09-forwarded-page.png` | 换端口后应用内浏览器仍能打开 `127.0.0.1:18083`，页面标记 `SSH-RELAY-E2E-OK`，服务端看到的来源是 `127.0.0.1` |
+
+热换规则的直接证据（`adb shell ss -ltn` + 应用内日志）：
+
+```
+13:40:04 [tun] 开始连接 tester@10.0.2.2:2222
+13:40:04 [ssh] SSH 已连接：tester@10.0.2.2:2222（服务端 SSH-2.0-APACHE-SSHD-2.14.0）
+13:40:04 [tun] 已监听 127.0.0.1:18082 → 127.0.0.1:18080
+13:41:51 [tun] 已监听 127.0.0.1:18083 → 127.0.0.1:18080
+13:41:51 [tun] 已应用新的转发规则，SSH 会话保持不变
+```
+
+13:40:04 之后没有第二次「开始连接」，即 SSH 会话没有重建；`ss -ltn` 同时只出现新端口。
+
+走查中发现并修掉的两个缺陷（都属于 0.1.0 遗留的 UI 接线问题）：
+
+1. `pendingChanges` 里的 `settingsLoaded` 从未被置为 `true`，导致「应用」提示条永远不显示；
+2. 提示条没有 `navigationBarsPadding()`，在 `enableEdgeToEdge()` 下被画到导航栏底下，按钮不可点。
+

@@ -12,6 +12,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.sshrelay.ui.BrowserScreen
 import dev.sshrelay.ui.SshRelayTheme
@@ -55,6 +57,15 @@ private fun SshRelayRoot(viewModel: TunnelViewModel, initialBrowserUrl: String? 
     var browserUrl by remember { mutableStateOf(initialBrowserUrl) }
     // An Activity method is not in scope inside a composable; take the context.
     val context = LocalContext.current
+
+    // The user grants the battery exemption in the system Settings app, so the state
+    // can only be re-read when this app comes back to the foreground. Without this
+    // the dialog/card would keep claiming "未允许" until the process restarts.
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        if (viewModel.refreshBatteryStatus()) {
+            viewModel.showMessage("已允许后台运行，系统不会再冻结隧道")
+        }
+    }
 
     val current = browserUrl
     if (current != null) {

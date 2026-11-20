@@ -40,6 +40,18 @@ sealed interface TunnelState {
 val TunnelState.isWorking: Boolean
     get() = this is TunnelState.Connecting || this is TunnelState.Connected || this is TunnelState.Reconnecting
 
+/**
+ * What the running supervisor is actually using right now.
+ *
+ * The UI compares this with the edited settings so it can tell the user that their
+ * edits have not taken effect yet, and [TunnelController.apply] compares it with a
+ * freshly built config to decide between a hot rule swap and a full reconnect.
+ */
+data class RunningSettings(
+    val config: SshConfig,
+    val rules: List<ForwardRule>,
+)
+
 /** Status of one configured rule at this instant. */
 data class ForwardStatus(
     val rule: ForwardRule,
@@ -75,6 +87,11 @@ class TunnelManager(
     private val _forwards = MutableStateFlow<List<ForwardStatus>>(emptyList())
     val forwards: StateFlow<List<ForwardStatus>> = _forwards.asStateFlow()
 
+    private val _applied = MutableStateFlow<RunningSettings?>(null)
+
+    /** What is running right now, or null when nothing is. */
+    val applied: StateFlow<RunningSettings?> = _applied.asStateFlow()
+
     /** Rolling log for the in-app console; `replay` keeps recent lines for late subscribers. */
     private val _log = MutableSharedFlow<String>(replay = 200, extraBufferCapacity = 512)
     val log: SharedFlow<String> = _log.asSharedFlow()
@@ -104,20 +121,68 @@ class TunnelManager(
     fun start(config: SshConfig, rules: List<ForwardRule>) {
         config.validate()?.let { throw IllegalArgumentException(it) }
         synchronized(lifecycleLock) {
-            stopInternal("重新启动")
+            // Deliberately does *not* publish Stopped: TunnelService watches the
+            // state flow and stops itself on Stopped, so a restart through that
+            // state would strip the tunnel of its foreground-service protection
+            // for as long as the reconnect takes (and forever, if the service is
+            // never started again). A restart is not a stop.
+            stopInternal("重新启动", publishStopped = false)
             this.config = config
             this.rules = rules
+            _applied.value = RunningSettings(config, rules)
             running = true
             _forwards.value = rules.filter { it.enabled }
                 .map { ForwardStatus(it, running = false, boundPort = it.localPort) }
+            // Publish the new attempt immediately: a restart replaces the session,
+            // so leaving the previous Connected state visible would be a lie (and
+            // the supervisor would publish it again a few milliseconds later).
+            _state.value = TunnelState.Connecting(1, config.describe())
         }
         emit("开始连接 ${config.describe()}")
         supervisor = scope.launch { supervise() }
     }
 
+    /**
+     * Swaps the forwarding rules on the *live* SSH session, without reconnecting.
+     *
+     * Reconnecting a healthy session just to add or remove a local listener is
+     * wasteful and, worse, audible: the user loses every open connection for a
+     * change that only concerns the local side. Rules take effect on the next
+     * successful connect when there is no session to swap on.
+     *
+     * Safe to call from any thread. Returns false when no tunnel is running, in
+     * which case the caller should use [start] instead.
+     */
+    fun applyRules(newRules: List<ForwardRule>): Boolean {
+        synchronized(lifecycleLock) {
+            if (!running) return false
+            rules = newRules
+            _applied.value = config?.let { RunningSettings(it, newRules) }
+
+            val session = transport
+            if (session == null || !session.isConnected) {
+                // Between attempts (or during a backoff): the supervisor reads
+                // `rules` on the next successful connect, and the UI should show
+                // the new set as not-yet-listening rather than keep the old one.
+                _forwards.value = newRules.filter { it.enabled }
+                    .map { ForwardStatus(it, running = false, boundPort = it.localPort) }
+                emit("规则已更新，将在 SSH 重新连接后生效")
+                return true
+            }
+
+            stopForwards()
+            startForwards(session)
+            emit("已应用新的转发规则，SSH 会话保持不变")
+            return true
+        }
+    }
+
     /** Stops everything: forwards first, then the SSH session. Idempotent. */
     fun stop(reason: String? = null) {
-        synchronized(lifecycleLock) { stopInternal(reason ?: "已停止") }
+        synchronized(lifecycleLock) {
+            stopInternal(reason ?: "已停止", publishStopped = true)
+            _applied.value = null
+        }
         emit("隧道已停止")
     }
 
@@ -129,14 +194,14 @@ class TunnelManager(
 
     fun shutdown() = stop("应用退出")
 
-    private fun stopInternal(reason: String) {
+    private fun stopInternal(reason: String, publishStopped: Boolean) {
         running = false
         supervisor?.cancel()
         supervisor = null
         stopForwards()
         runCatching { transport?.close() }
         transport = null
-        if (_state.value !is TunnelState.Failed) {
+        if (publishStopped && _state.value !is TunnelState.Failed) {
             _state.value = TunnelState.Stopped(reason)
         }
     }
@@ -186,7 +251,14 @@ class TunnelManager(
                 reason = e.message ?: e.toString()
                 emit("连接异常：$reason")
             } finally {
-                stopForwards()
+                // Only tear down listeners that belong to *this* session. A restart
+                // installs a new session (and new listeners) while the cancelled
+                // supervisor is still unwinding; without this guard the dying
+                // supervisor would stop the new listeners a moment after they came
+                // up, which looks exactly like "the tunnel silently stopped working".
+                synchronized(lifecycleLock) {
+                    if (transport === current) stopForwards()
+                }
                 runCatching { current?.close() }
                 if (transport === current) transport = null
             }
@@ -206,6 +278,7 @@ class TunnelManager(
                 }
                 _state.value = TunnelState.Failed(text, kind)
                 running = false
+                _applied.value = null
                 emit("已停止自动重连：$text")
                 break
             }
@@ -217,40 +290,50 @@ class TunnelManager(
             delay(delayMs)
         }
 
+        _applied.value = null
         if (_state.value !is TunnelState.Failed) {
             _state.value = TunnelState.Stopped(reason)
         }
     }
 
     private fun startForwards(session: SshTransport) {
-        servers.clear()
-        val statuses = rules.filter { it.enabled }.map { rule ->
-            val server = LocalForwardServer(
-                rule = rule,
-                connector = session,
-                scope = scope,
-                idleTimeoutMs = idleTimeoutMs,
-            )
-            try {
-                server.start()
-                servers[rule.id] = server
-                emit("已监听 127.0.0.1:${server.boundPort} → ${rule.remoteHost}:${rule.remotePort}")
-                ForwardStatus(rule, running = true, boundPort = server.boundPort)
-            } catch (e: Exception) {
-                emit("本地端口 ${rule.localPort} 监听失败：${e.message}")
-                ForwardStatus(rule, running = false, boundPort = rule.localPort, error = e.message ?: "监听失败")
+        synchronized(lifecycleLock) {
+            servers.clear()
+            val statuses = rules.filter { it.enabled }.map { rule ->
+                val server = LocalForwardServer(
+                    rule = rule,
+                    connector = session,
+                    scope = scope,
+                    idleTimeoutMs = idleTimeoutMs,
+                )
+                try {
+                    server.start()
+                    servers[rule.id] = server
+                    emit("已监听 127.0.0.1:${server.boundPort} → ${rule.remoteHost}:${rule.remotePort}")
+                    ForwardStatus(rule, running = true, boundPort = server.boundPort)
+                } catch (e: Exception) {
+                    emit("本地端口 ${rule.localPort} 监听失败：${e.message}")
+                    ForwardStatus(
+                        rule,
+                        running = false,
+                        boundPort = rule.localPort,
+                        error = e.message ?: "监听失败",
+                    )
+                }
             }
+            _forwards.value = statuses
+            startStatsMirror()
         }
-        _forwards.value = statuses
-        startStatsMirror()
     }
 
     private fun stopForwards() {
-        statsJob?.cancel()
-        statsJob = null
-        servers.values.forEach { runCatching { it.stop("隧道停止") } }
-        servers.clear()
-        _forwards.update { list -> list.map { it.copy(running = false, stats = ForwardStats()) } }
+        synchronized(lifecycleLock) {
+            statsJob?.cancel()
+            statsJob = null
+            servers.values.forEach { runCatching { it.stop("隧道停止") } }
+            servers.clear()
+            _forwards.update { list -> list.map { it.copy(running = false, stats = ForwardStats()) } }
+        }
     }
 
     private fun startStatsMirror() {

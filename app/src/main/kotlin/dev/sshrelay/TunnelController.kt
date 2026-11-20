@@ -83,19 +83,50 @@ class TunnelController(
 
         // Foreground service first: once the UI is backgrounded Android may freeze
         // the process, which would abort a handshake in progress.
-        val failure = runCatching {
-            context.startForegroundService(
-                Intent(context, TunnelService::class.java).setAction(TunnelService.ACTION_START)
-            )
-        }.exceptionOrNull()
-        if (failure != null) {
-            return "无法启动前台服务：${failure.message}"
-        }
+        ensureForegroundService()?.let { return it }
 
         return runCatching { graph.manager.start(config, rules) }
             .exceptionOrNull()
             ?.let { it.message ?: "启动失败" }
     }
+
+    /**
+     * Applies edited settings to an already running tunnel.
+     *
+     * Two paths, because the two kinds of change have very different costs:
+     *  - SSH coordinates / credentials changed: only a new session can pick those
+     *    up, so the tunnel restarts (without tearing down the foreground service).
+     *  - only forwarding rules changed: the local listeners are swapped on the live
+     *    session, so the SSH connection and every other rule keep working.
+     *
+     * Returns null when applied, or a message explaining why not.
+     */
+    suspend fun apply(): String? {
+        val current = graph.manager.applied.value
+        // Nothing to reload: behave like the start button.
+        if (current == null || !graph.manager.isRunning) return start()
+
+        val settings = currentSettings()
+        val (config, rules) = buildConfig(settings).getOrElse {
+            return it.message ?: "配置无效"
+        }
+        ensureForegroundService()?.let { return it }
+
+        return runCatching {
+            if (current.config != config) {
+                graph.manager.start(config, rules)
+            } else if (!graph.manager.applyRules(rules)) {
+                graph.manager.start(config, rules)
+            }
+        }.exceptionOrNull()?.let { it.message ?: "应用失败" }
+    }
+
+    private fun ensureForegroundService(): String? =
+        runCatching {
+            context.startForegroundService(
+                Intent(context, TunnelService::class.java).setAction(TunnelService.ACTION_START)
+            )
+        }.exceptionOrNull()?.let { "无法启动前台服务：${it.message}" }
 
     fun stop(reason: String = "用户停止") {
         graph.manager.stop(reason)

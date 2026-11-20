@@ -250,6 +250,73 @@ class JschTunnelIntegrationTest {
     }
 
     @Test
+    fun `applying new rules swaps listeners without dropping the ssh session`() = runBlocking {
+        val manager = TunnelManager(
+            scope = scope,
+            transportFactory = { cfg -> JschTransport(cfg, TofuHostKeyPolicy(InMemoryHostKeyStore())) },
+            backoff = BackoffPolicy(initialDelayMs = 100, maxDelayMs = 300),
+        )
+        manager.start(config(), listOf(dev.sshrelay.forward.ForwardRule("web", 0, "127.0.0.1", http.port)))
+        awaitConnected(manager)
+        val oldPort = awaitForwardPort(manager)
+        val connectedSince = (manager.state.value as TunnelState.Connected).sinceEpochMs
+
+        val replacement = dev.sshrelay.forward.ForwardRule("db", 0, "127.0.0.1", http.port)
+        assertTrue(manager.applyRules(listOf(replacement)))
+
+        // the new listener serves traffic immediately ...
+        withTimeout(10_000) {
+            while (manager.forwards.value.none { it.rule.id == "db" && it.running }) delay(20)
+        }
+        val newPort = manager.forwards.value.first { it.rule.id == "db" }.boundPort
+        assertTrue(httpGet(newPort).contains("SSH-RELAY-E2E-OK"))
+
+        // ... the old port is released ...
+        withTimeout(10_000) {
+            while (true) {
+                try {
+                    Socket("127.0.0.1", oldPort).use { }
+                    delay(20)
+                } catch (_: IOException) {
+                    break
+                }
+            }
+        }
+
+        // ... and the SSH session itself was never replaced.
+        val state = manager.state.value
+        assertTrue("expected the session to stay connected, got $state", state is TunnelState.Connected)
+        assertEquals(connectedSince, (state as TunnelState.Connected).sinceEpochMs)
+        assertEquals(listOf("db"), manager.applied.value?.rules?.map { it.id })
+
+        manager.stop("test over")
+        assertEquals(null, manager.applied.value)
+    }
+
+    @Test
+    fun `restarting the tunnel never publishes a stopped state`() = runBlocking {
+        // Stopped is what tells TunnelService to tear itself down; a restart that
+        // flashed Stopped would silently drop the foreground-service protection.
+        val manager = TunnelManager(
+            scope = scope,
+            transportFactory = { cfg -> JschTransport(cfg, TofuHostKeyPolicy(InMemoryHostKeyStore())) },
+            backoff = BackoffPolicy(initialDelayMs = 100, maxDelayMs = 300),
+        )
+        val rule = dev.sshrelay.forward.ForwardRule("web", 0, "127.0.0.1", http.port)
+        manager.start(config(), listOf(rule))
+        awaitConnected(manager)
+
+        manager.start(config(), listOf(rule))
+        assertTrue(
+            "restart must not look like a user stop, got ${manager.state.value}",
+            manager.state.value !is TunnelState.Stopped,
+        )
+        awaitConnected(manager)
+        manager.stop("test over")
+        assertTrue(manager.state.value is TunnelState.Stopped)
+    }
+
+    @Test
     fun `tunnel manager gives up on a bad password instead of looping`() = runBlocking {
         val manager = TunnelManager(
             scope = scope,
