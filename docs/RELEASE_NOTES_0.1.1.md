@@ -5,6 +5,45 @@
 1. 隧道跑起来后再改端口/规则，界面上没有入口让改动生效；
 2. 隧道切到后台立刻断开，切回来自动重连、再切走又断。
 
+## Changelog（0.1.0 → 0.1.1）
+
+### 新增
+
+- **「应用」按钮**：运行中修改端口/规则后，底部出现「配置已修改，尚未生效」提示条，
+  点「应用」即可生效；只改规则时在活的 SSH 会话上热换监听，**不重连**。（`554bddf`）
+- **电池优化豁免引导**：启动时检测 `isIgnoringBatteryOptimizations()`，未豁免则弹框，
+  「去设置」依次尝试应用级确认弹窗 → 电池优化列表页 → 应用详情页；
+  新增「后台保活」卡片与启动日志警告。（`554bddf`）
+- **新增设备测试**：真实修改 `dumpsys deviceidle whitelist` 验证豁免读取；
+  验证三个系统入口的顺序与 `package:` 作用域。（`554bddf`）
+
+### 修复
+
+- 修复「配置已修改」提示条**永远不出现**：`pendingChanges` 依赖的 `settingsLoaded`
+  从未被置为 `true`。（`554bddf`）
+- 修复提示条被系统导航栏遮挡、按钮点不到：`enableEdgeToEdge()` 下补 `navigationBarsPadding()`。（`554bddf`）
+- 修复重启隧道时短暂发布 `Stopped` 导致前台服务被拆掉的问题（`TunnelManager` 内部重启不再发布停止态）。（`554bddf`）
+
+### 测试与文档
+
+- JVM 测试 34/34（新增：热换规则不断开会话、重启不发布 `Stopped`）。
+- 模拟器仪器化测试 **OK (10 tests)**（Android 15 / API 35 / x86_64）。
+- 新增 `docs/VERIFICATION.md` 第 8 节，记录本次走查的日志与截图证据。（`554bddf`）
+
+### 提交
+
+| 提交 | 说明 |
+|---|---|
+| `554bddf` | feat(tunnel): reload edited rules live and guide the battery-optimisation exemption |
+| `0e9d91a` | chore(release): 0.1.1（版本号与本文档） |
+
+### Assets
+
+| 文件 | 说明 |
+|---|---|
+| `ssh-relay-0.1.1-debug.apk` | debug APK，26,811,091 字节 |
+| `ssh-relay-0.1.1-debug.apk.sha256` | 上面这个 APK 的 SHA-256，用于校验 |
+
 ## 1. 改完规则，点「应用」就生效
 
 之前编辑保存在本地，但**运行中的隧道不会跟着变**——改端口等于白改。现在：
